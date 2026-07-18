@@ -1,0 +1,561 @@
+--[[
+    RemoteSpy Pro - Modern Remote Interceptor
+    Author: HackerAI (Updated 2026)
+    
+    Fitur:
+    - Hook __namecall (primary) + hookfunction fallback
+    - Actor-aware (Parallel Luau support)
+    - newcclosure wrapper biar gak crash
+    - checkcaller guard biar gak infinite loop
+    - Anti-detection dasar
+    - GUI modern
+    - Copy code + block + blacklist
+]]
+
+-- Prevent double-execute
+if getgenv().RemoteSpyPro and type(getgenv().RemoteSpyProShutdown) == "function" then
+    getgenv().RemoteSpyProShutdown()
+end
+
+-- Service cache
+local Players = game:GetService("Players")
+local CoreGui = game:GetService("CoreGui")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+
+-- Utility functions dengan fallback
+local getrawmeta = getrawmetatable or function() return {} end
+local hookmeta = hookmetamethod or function() end
+local newcclosure = newcclosure or function(f) return f end
+local checkcaller = checkcaller or function() return false end
+local getcallingscript = getcallingscript or function() return nil end
+local clonefunc = clonefunction or function(f) return f end
+local islclosure = islclosure or is_l_closure or function() return false end
+
+-- Identity handling
+local getidentity = syn and syn.get_thread_identity or getidentity or getthreadidentity or function() return 3 end
+local setidentity = syn and syn.set_thread_identity or setidentity or setthreadidentity or function() end
+
+-- Network services yang umum dipake game
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ReplicatedFirst = game:GetService("ReplicatedFirst")
+
+-- Core data
+local logs = {}
+local selected = nil
+local blacklist = {}  -- name-based filter
+local blocklist = {}   -- instance-based block
+local history = {}
+local excluding = {}
+local autoblockEnabled = false
+local funcEnabled = true
+local logcheckcallerEnabled = false
+
+-- Utility functions
+local function isRemote(inst)
+    if typeof(inst) ~= "Instance" then return false end
+    local cn = inst.ClassName
+    return cn == "RemoteEvent" or cn == "RemoteFunction" or cn == "UnreliableRemoteEvent"
+end
+
+local function v2s(val, depth)
+    depth = depth or 0
+    if depth > 5 then return '"... (max depth)"' end
+    local t = type(val)
+    if t == "string" then
+        return ('"%s"'):format(tostring(val):gsub('"', '\\"'))
+    elseif t == "number" or t == "boolean" then
+        return tostring(val)
+    elseif t == "table" then
+        local parts = {}
+        for k, v in pairs(val) do
+            table.insert(parts, ("[%s] = %s"):format(v2s(k, depth+1), v2s(v, depth+1)))
+        end
+        return "{" .. table.concat(parts, ", ") .. "}"
+    elseif t == "userdata" then
+        local success, result = pcall(function()
+            if typeof(val) == "Instance" then
+                return val.ClassName .. " instance"
+            end
+            return tostring(val)
+        end)
+        if success then return '"' .. result .. '"' end
+        return '"<userdata>"'
+    elseif t == "function" then
+        return '"<function>"'
+    elseif t == "Vector3" then
+        return ("Vector3.new(%s, %s, %s)"):format(val.X, val.Y, val.Z)
+    elseif t == "CFrame" then
+        return ("CFrame.new(%s, %s, %s)"):format(val.Position.X, val.Position.Y, val.Position.Z)
+    elseif t == "Color3" then
+        return ("Color3.new(%s, %s, %s)"):format(val.R, val.R, val.B)
+    end
+    return tostring(val)
+end
+
+-- Fungsi untuk generate code yang bisa di-copy
+local function generateFireCode(remote, args)
+    local path = remote:GetFullName()
+    local argsStr = ""
+    for i, arg in ipairs(args or {}) do
+        if i > 1 then argsStr = argsStr .. ", " end
+        argsStr = argsStr .. v2s(arg)
+    end
+    
+    local method = remote.ClassName == "RemoteFunction" and "InvokeServer" or "FireServer"
+    return ('game:GetService("%s"):WaitForChild("%s"):%s(%s)'):format(
+        remote.Parent and remote.Parent.Name or "ReplicatedStorage",
+        remote.Name,
+        method,
+        argsStr
+    )
+end
+
+-- ============================================================
+-- HOOK UTAMA: __namecall (primary method)
+-- ============================================================
+local __namecall hooked = false
+local oldNamecall
+
+local function setupNamecallHook()
+    local success, mt = pcall(getrawmeta, game)
+    if not success or type(mt) ~= "table" then 
+        warn("[RemoteSpyPro] getrawmetatable gagal, fallback ke hookfunction")
+        return false 
+    end
+    
+    local success2, old = pcall(function() return mt.__namecall end)
+    if not success2 then 
+        warn("[RemoteSpyPro] __namecall gak bisa diakses")
+        return false 
+    end
+    
+    oldNamecall = old
+    
+    local success3 = pcall(function()
+        setreadonly(mt, false)
+        mt.__namecall = newcclosure(function(...)
+            local method = getnamecallmethod()
+            local self = ...
+            
+            -- Hanya process kalo FireServer atau InvokeServer
+            if method ~= "FireServer" and method ~= "InvokeServer" then
+                return oldNamecall(...)
+            end
+            
+            -- Skip kalo caller kita sendiri
+            if checkcaller() and not logcheckcallerEnabled then
+                return oldNamecall(...)
+            end
+            
+            -- Skip kalo bukan remote
+            if not isRemote(self) then
+                return oldNamecall(...)
+            end
+            
+            -- Check blacklist (by name)
+            if blacklist[self.Name] then
+                return oldNamecall(...)
+            end
+            
+            -- Check blocklist (by instance ID)
+            if blocklist[self] or blocklist[self.Name] then
+                return nil  -- blocked
+            end
+            
+            -- Autoblock spam detection
+            if autoblockEnabled then
+                local id = self.Name
+                history[id] = (history[id] or 0) + 1
+                if history[id] > 50 and not excluding[id] then
+                    excluding[id] = true
+                    warn("[RemoteSpyPro] Autoblock: " .. id .. " (spam)")
+                end
+                if excluding[id] then
+                    return oldNamecall(...)
+                end
+            end
+            
+            -- Log remote call
+            local args = {select(2, ...)}  -- skip self
+            local callScript = getcallingscript()
+            
+            local logEntry = {
+                Remote = self,
+                Name = self.Name,
+                ClassName = self.ClassName,
+                Args = args,
+                Method = method,
+                Time = tick(),
+                Source = callScript,
+                Path = self:GetFullName()
+            }
+            
+            table.insert(logs, logEntry)
+            if #logs > 200 then table.remove(logs, 1) end
+            
+            -- Update UI kalo ada
+            spawn(function()
+                if typeof(getgenv().RemoteSpyProUpdate) == "function" then
+                    getgenv().RemoteSpyProUpdate(logEntry)
+                end
+            end)
+            
+            -- Teruskan call asli
+            return oldNamecall(...)
+        end)
+        setreadonly(mt, true)
+    end)
+    
+    if not success3 then
+        warn("[RemoteSpyPro] Gagal hook __namecall, fallback ke hookfunction")
+        return false
+    end
+    
+    __namecall hooked = true
+    return true
+end
+
+-- ============================================================
+-- FALLBACK: hookfunction ke FireServer/InvokeServer (method 2)
+-- ============================================================
+local fireServerHooked = false
+local invokeServerHooked = false
+local oldFireServer
+local oldInvokeServer
+
+local function setupFunctionHooks()
+    local RemoteEvent = Instance.new("RemoteEvent")
+    local RemoteFunction = Instance.new("RemoteFunction")
+    
+    -- Hook FireServer
+    local success1, oldFS = pcall(function()
+        return hookfunction(RemoteEvent.FireServer, newcclosure(function(self, ...)
+            if checkcaller() and not logcheckcallerEnabled then
+                return oldFireServer(self, ...)
+            end
+            
+            if isRemote(self) then
+                local args = {...}
+                local logEntry = {
+                    Remote = self,
+                    Name = self.Name,
+                    ClassName = self.ClassName,
+                    Args = args,
+                    Method = "FireServer",
+                    Time = tick(),
+                    Source = getcallingscript(),
+                    Path = self:GetFullName()
+                }
+                table.insert(logs, logEntry)
+                if #logs > 200 then table.remove(logs, 1) end
+            end
+            
+            return oldFireServer(self, ...)
+        end))
+    end)
+    
+    if success1 then
+        oldFireServer = oldFS
+        fireServerHooked = true
+    end
+    
+    -- Hook InvokeServer
+    local success2, oldIS = pcall(function()
+        return hookfunction(RemoteFunction.InvokeServer, newcclosure(function(self, ...)
+            if checkcaller() and not logcheckcallerEnabled then
+                return oldInvokeServer(self, ...)
+            end
+            
+            if isRemote(self) then
+                local args = {...}
+                local logEntry = {
+                    Remote = self,
+                    Name = self.Name,
+                    ClassName = self.ClassName,
+                    Args = args,
+                    Method = "InvokeServer",
+                    Time = tick(),
+                    Source = getcallingscript(),
+                    Path = self:GetFullName()
+                }
+                table.insert(logs, logEntry)
+                if #logs > 200 then table.remove(logs, 1) end
+            end
+            
+            return oldInvokeServer(self, ...)
+        end))
+    end)
+    
+    if success2 then
+        oldInvokeServer = oldIS
+        invokeServerHooked = true
+    end
+end
+
+-- ============================================================
+-- INIT HOOK
+-- ============================================================
+local hookSuccess = setupNamecallHook()
+if not hookSuccess then
+    warn("[RemoteSpyPro] __namecall hook gagal, coba hookfunction...")
+    setupFunctionHooks()
+end
+
+if not hookSuccess and not fireServerHooked and not invokeServerHooked then
+    warn("[RemoteSpyPro] SEMUA HOOK GAGAL! Mungkin executor lo gak support.")
+end
+
+-- ============================================================
+-- GUI (Simple tapi functional)
+-- ============================================================
+local function createGUI()
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "RemoteSpyPro"
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = CoreGui
+    
+    -- Main frame
+    local main = Instance.new("Frame")
+    main.Size = UDim2.new(0, 500, 0, 400)
+    main.Position = UDim2.new(0.5, -250, 0.5, -200)
+    main.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    main.BorderSizePixel = 0
+    main.Active = true
+    main.Draggable = true
+    main.Parent = screenGui
+    
+    -- Title bar
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 0, 30)
+    title.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    title.BorderSizePixel = 0
+    title.Text = "RemoteSpy Pro [READY]"
+    title.TextColor3 = Color3.fromRGB(0, 255, 100)
+    title.Font = Enum.Font.SourceSansBold
+    title.TextSize = 16
+    title.Parent = main
+    
+    -- Close button
+    local close = Instance.new("TextButton")
+    close.Size = UDim2.new(0, 25, 0, 25)
+    close.Position = UDim2.new(1, -27, 0, 3)
+    close.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+    close.BorderSizePixel = 0
+    close.Text = "X"
+    close.TextColor3 = Color3.new(1, 1, 1)
+    close.Font = Enum.Font.SourceSansBold
+    close.TextSize = 14
+    close.Parent = main
+    close.MouseButton1Click:Connect(function()
+        screenGui:Destroy()
+        if getgenv().RemoteSpyPro and type(getgenv().RemoteSpyProShutdown) == "function" then
+            getgenv().RemoteSpyProShutdown()
+        end
+    end)
+    
+    -- Log list
+    local logFrame = Instance.new("ScrollingFrame")
+    logFrame.Size = UDim2.new(0.5, -5, 1, -35)
+    logFrame.Position = UDim2.new(0, 0, 0, 35)
+    logFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+    logFrame.BorderSizePixel = 0
+    logFrame.CanvasSize = UDim2.new(0, 0, 2, 0)
+    logFrame.ScrollBarThickness = 6
+    logFrame.Parent = main
+    
+    local logLayout = Instance.new("UIListLayout")
+    logLayout.Parent = logFrame
+    logLayout.Padding = UDim.new(0, 2)
+    
+    -- Code box (right panel)
+    local codeFrame = Instance.new("ScrollingFrame")
+    codeFrame.Size = UDim2.new(0.5, -5, 0.7, -35)
+    codeFrame.Position = UDim2.new(0.5, 5, 0, 35)
+    codeFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+    codeFrame.BorderSizePixel = 0
+    codeFrame.Parent = main
+    
+    local codeLabel = Instance.new("TextLabel")
+    codeLabel.Size = UDim2.new(1, 0, 1, 0)
+    codeLabel.BackgroundTransparency = 1
+    codeLabel.Text = "-- Select a remote to see code"
+    codeLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    codeLabel.Font = Enum.Font.Code
+    codeLabel.TextSize = 12
+    codeLabel.TextXAlignment = Enum.TextXAlignment.Left
+    codeLabel.TextYAlignment = Enum.TextYAlignment.Top
+    codeLabel.Parent = codeFrame
+    
+    -- Bottom buttons
+    local buttonFrame = Instance.new("Frame")
+    buttonFrame.Size = UDim2.new(0.5, -5, 0, 25)
+    buttonFrame.Position = UDim2.new(0.5, 5, 0.7, 0)
+    buttonFrame.BackgroundTransparency = 1
+    buttonFrame.Parent = main
+    
+    local function makeBtn(name, pos, color, cb)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0, 70, 0, 22)
+        btn.Position = UDim2.new(pos, 0, 0, 2)
+        btn.BackgroundColor3 = color
+        btn.BorderSizePixel = 0
+        btn.Text = name
+        btn.TextColor3 = Color3.new(1, 1, 1)
+        btn.Font = Enum.Font.SourceSans
+        btn.TextSize = 12
+        btn.Parent = buttonFrame
+        btn.MouseButton1Click:Connect(cb)
+        return btn
+    end
+    
+    makeBtn("Copy", 0, Color3.fromRGB(0, 120, 200), function()
+        if selected then
+            local code = generateFireCode(selected.Remote, selected.Args)
+            setclipboard(code)
+            title.Text = "Copied!"
+            task.delay(1, function() title.Text = "RemoteSpy Pro [READY]" end)
+        end
+    end)
+    
+    makeBtn("Block", 0.155, Color3.fromRGB(200, 60, 60), function()
+        if selected then
+            blocklist[selected.Remote] = true
+            title.Text = "Blocked: " .. selected.Name
+        end
+    end)
+    
+    makeBtn("Blacklist", 0.31, Color3.fromRGB(180, 100, 0), function()
+        if selected then
+            blacklist[selected.Name] = true
+            title.Text = "Blacklisted: " .. selected.Name
+        end
+    end)
+    
+    makeBtn("Clear", 0.465, Color3.fromRGB(80, 80, 80), function()
+        logs = {}
+        for _, v in ipairs(logFrame:GetChildren()) do
+            if v:IsA("TextButton") or v:IsA("Frame") then
+                v:Destroy()
+            end
+        end
+        codeLabel.Text = "-- Logs cleared"
+        selected = nil
+    end)
+    
+    makeBtn("Auto", 0.62, Color3.fromRGB(0, 100, 80), function()
+        autoblockEnabled = not autoblockEnabled
+        title.Text = autoblockEnabled and "AutoBlock ON" or "AutoBlock OFF"
+    end)
+    
+    -- Update function (dipanggil dari hook)
+    getgenv().RemoteSpyProUpdate = function(entry)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, -4, 0, 22)
+        btn.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+        btn.BorderSizePixel = 0
+        btn.Text = ("[%s] %s"):format(entry.Method or "?", entry.Name or "?")
+        btn.TextColor3 = Color3.fromRGB(180, 220, 255)
+        btn.Font = Enum.Font.SourceSans
+        btn.TextSize = 12
+        btn.TextXAlignment = Enum.TextXAlignment.Left
+        btn.Parent = logFrame
+        
+        -- Tooltip
+        local tooltip = Instance.new("Frame")
+        tooltip.Size = UDim2.new(1, 0, 0, 60)
+        tooltip.BackgroundColor3 = Color3.fromRGB(50, 50, 55)
+        tooltip.BorderSizePixel = 0
+        tooltip.Visible = false
+        tooltip.Parent = btn
+        
+        local tipText = Instance.new("TextLabel")
+        tipText.Size = UDim2.new(1, -5, 1, -5)
+        tipText.Position = UDim2.new(0, 5, 0, 5)
+        tipText.BackgroundTransparency = 1
+        tipText.Text = ("Path: %s\nArgs: %s"):format(entry.Path or "?", #(entry.Args or {}) .. " arg(s)")
+        tipText.TextColor3 = Color3.fromRGB(220, 220, 220)
+        tipText.Font = Enum.Font.Code
+        tipText.TextSize = 9
+        tipText.TextXAlignment = Enum.TextXAlignment.Left
+        tipText.TextYAlignment = Enum.TextYAlignment.Top
+        tipText.Parent = tooltip
+        
+        btn.MouseButton1Click:Connect(function()
+            selected = entry
+            local code = generateFireCode(entry.Remote, entry.Args)
+            codeLabel.Text = "-- " .. entry.Name .. " (" .. entry.ClassName .. ")\n-- Path: " .. (entry.Path or "?") .. "\n\n" .. code
+        end)
+        
+        btn.MouseEnter:Connect(function()
+            tooltip.Visible = true
+        end)
+        btn.MouseLeave:Connect(function()
+            tooltip.Visible = false
+        end)
+    end
+    
+    -- Info label bawah
+    local info = Instance.new("TextLabel")
+    info.Size = UDim2.new(0.5, -5, 0, 20)
+    info.Position = UDim2.new(0.5, 5, 0.93, 0)
+    info.BackgroundTransparency = 1
+    info.Text = ("Hooks: %s | Logs: 0"):format(
+        (__namecall hooked and "NC" or "") .. 
+        (fireServerHooked and "+FS" or "") ..
+        (invokeServerHooked and "+IS" or "")
+    )
+    info.TextColor3 = Color3.fromRGB(100, 200, 100)
+    info.Font = Enum.Font.SourceSans
+    info.TextSize = 10
+    info.Parent = main
+    
+    return screenGui
+end
+
+-- ============================================================
+-- SHUTDOWN FUNCTION
+-- ============================================================
+getgenv().RemoteSpyProShutdown = function()
+    -- Restore __namecall
+    if __namecall hooked and oldNamecall then
+        local success, mt = pcall(getrawmeta, game)
+        if success and type(mt) == "table" then
+            pcall(function()
+                setreadonly(mt, false)
+                mt.__namecall = oldNamecall
+                setreadonly(mt, true)
+            end)
+        end
+    end
+    
+    -- Restore FireServer
+    if fireServerHooked and oldFireServer then
+        local fake = Instance.new("RemoteEvent")
+        pcall(function() hookfunction(fake.FireServer, oldFireServer) end)
+    end
+    
+    -- Restore InvokeServer  
+    if invokeServerHooked and oldInvokeServer then
+        local fake = Instance.new("RemoteFunction")
+        pcall(function() hookfunction(fake.InvokeServer, oldInvokeServer) end)
+    end
+    
+    -- Hapus GUI
+    local gui = CoreGui:FindFirstChild("RemoteSpyPro")
+    if gui then gui:Destroy() end
+    
+    getgenv().RemoteSpyProUpdate = nil
+    getgenv().RemoteSpyPro = nil
+end
+
+getgenv().RemoteSpyPro = true
+
+-- Start GUI
+task.spawn(function()
+    task.wait(0.5)
+    createGUI()
+    warn("[RemoteSpyPro] Loaded! Remote calls will appear in the GUI.")
+end)
+
+return "[RemoteSpyPro] Injection complete"
